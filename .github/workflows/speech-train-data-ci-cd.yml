@@ -1,0 +1,544 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT license.
+
+###############################################################################
+#
+# Custom Speech Continuous Improvement Pipeline for GitHub Actions
+#
+###############################################################################
+
+name: SpeechTrainDataCICD
+
+on:
+  push:
+    # Execute on pushes to master.
+    branches:
+      - master
+    # The push must include updates to training data.
+    paths:
+      # The path from the root of the repository to a .zip with .wav files and a
+      # .txt transcript used for training.
+      - "training/audio-and-trans.zip"
+      # The path from the root of the repository to the pronunciation data file.
+      - "training/pronunciation.txt"
+      # The path from the root of the repository to the related text data file.
+      - "training/related-text.txt"
+
+env:
+  # `true` if the repository is private and `false` otherwise.
+  IS_PRIVATE_REPOSITORY: false
+  # See Language Support for available locales:
+  # https://docs.microsoft.com/en-us/azure/cognitive-services/speech-service/language-support
+  SPEECH_LOCALE: "en-US"
+  #############################################################################
+  # Testing Data
+  #############################################################################
+  # The name and extension of the .txt transcript file that will be extracted
+  # from `testZipSourcePath`.
+  TEST_TRANS_FILE: "trans.txt"
+  # The path from the root of the repository to a .zip with .wav files and a
+  # .txt transcript used for testing.
+  TEST_ZIP_SOURCE_PATH: "testing/audio-and-trans.zip"
+  #############################################################################
+  # Training Data
+  #############################################################################
+  # The path from the root of the repository to the pronunciation data file. Set
+  # to an empty string if you are training an acoustic model.
+  PRONUNCIATION_FILE_PATH: "training/pronunciation.txt"
+  # The path from the root of the repository to the related text data file. Set
+  # to an empty string if you are training an acoustic model.
+  RELATED_TEXT_FILE_PATH: "training/related-text.txt"
+  # The name and extension of the .txt transcript file that will be extracted
+  # from `trainZipSourcePath`. Set to an empty string if you are training a
+  # language model.
+  TRAIN_TRANS_FILE: ""
+  # The path from the root of the repository to a .zip with .wav files and a
+  # .txt transcript used for training. Set to an empty string if you are
+  # training a language model.
+  TRAIN_ZIP_SOURCE_PATH: ""
+  # version of Speech CLI tool to install and use
+  SPX_VERSION: "1.0.0"
+
+jobs:
+  #############################################################################
+  #
+  #   Workflow Setup - Used for updates to any data along with releasing.
+  #
+  #############################################################################
+
+  setup:
+    name: Workflow setup
+    runs-on: ubuntu-latest
+
+    steps:
+      # https://github.com/Azure/azure-cli
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create the test-results container if needed
+        run: |
+          az storage container exists --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --name test-results --auth-mode login > verify-test-results-container.json
+          results_container_exists=$(node --eval "fs.readFile('verify-test-results-container.json','utf8',(err,data)=>console.log(JSON.parse(data).exists))")
+          if [ $results_container_exists != 'true' ]
+          then
+            az storage container create --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --name test-results --auth-mode login
+            echo CREATED TEST RESULTS CONTAINER.
+          fi
+
+      - name: Create the configuration container if needed
+        run: |
+          az storage container exists --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --name configuration --auth-mode login > verify-configuration-container.json
+          config_container_exists=$(node --eval "fs.readFile('verify-configuration-container.json','utf8',(err,data)=>console.log(JSON.parse(data).exists))")
+          if [ $config_container_exists != 'true' ]
+          then
+            az storage container create --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --name configuration --public-access blob --auth-mode login
+            echo CREATED CONFIGURATION CONTAINER.
+          fi
+
+  #############################################################################
+  #
+  #   Continuous Integration - handle updates to training data.
+  #
+  #############################################################################
+
+  train_data_update:
+    name: Build and test new model
+    runs-on: ubuntu-latest
+    # Execute when setup finishes executing and passes.
+    needs: setup
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2
+        with:
+          # Indicates all history.
+          fetch-depth: "0"
+      #     lfs: true
+
+      # - name: Checkout LFS objects
+      #   run: git lfs checkout
+
+      - name: Set environment variables
+        run: |
+          echo "CURRENT_COMMIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "TEST_AUDIO_ZIP_FILE=test-audio.zip" >> $GITHUB_ENV
+          echo "TEST_BUILD_FOLDER_PATH=build-speech-test" >> $GITHUB_ENV
+          echo "TRAIN_AUDIO_ZIP_FILE=train-audio.zip" >> $GITHUB_ENV
+          echo "TRAIN_BUILD_FOLDER_PATH=build-speech-train" >> $GITHUB_ENV
+
+      # Custom Speech models trained with the V2 SDK must have either
+      # TRAIN_ZIP_SOURCE_PATH or both PRONUNCIATION_FILE_PATH and
+      # RELATED_TEXT_FILE_PATH so that only a language model or acoustic model
+      # will be trained.
+      - name: Prepare for an Acoustic or Language model
+        run: |
+          if [[ "${{ env.PRONUNCIATION_FILE_PATH }}" == "" ]] && [[ "${{ env.RELATED_TEXT_FILE_PATH }}" == "" ]]
+          then
+            if [[ "${{ env.TRAIN_ZIP_SOURCE_PATH }}" == "" ]]
+            then
+              echo "::error ::Define both PRONUNCIATION_FILE_PATH and RELATED_TEXT_FILE_PATH to train language models. Or define TRAIN_ZIP_SOURCE_PATH to train acoustic models."
+              exit 1
+            fi
+            echo CONFIGURED REPOSITORY FOR ACOUSTIC MODELS.
+          elif [[ "${{ env.TRAIN_ZIP_SOURCE_PATH }}" == "" ]]
+          then
+            if [[ "${{ env.PRONUNCIATION_FILE_PATH }}" == "" ]] || [[ "${{ env.RELATED_TEXT_FILE_PATH }}" == "" ]]
+            then
+              echo "::error ::If TRAIN_ZIP_SOURCE_PATH is not defined, then PRONUNCIATION_FILE_PATH and RELATED_TEXT_FILE_PATH must both be defined to train language models."
+              exit 1
+            fi
+            mkdir "${{ env.TRAIN_BUILD_FOLDER_PATH }}"
+            echo CONFIGURED REPOSITORY FOR LANGUAGE MODELS.
+          else
+            echo "::error ::Define both PRONUNCIATION_FILE_PATH and RELATED_TEXT_FILE_PATH to train language models. Or define TRAIN_ZIP_SOURCE_PATH to train acoustic models."
+            exit 1
+          fi
+
+      # https://github.com/Azure-Samples/cognitive-services-speech-tools
+      - name: Install and configure Speech CLI
+        run: |
+          dotnet tool install -g Microsoft.CognitiveServices.Speech.CLI --version ${{ env.SPX_VERSION }}
+          spx config @name --set ${{ secrets.SPEECH_PROJECT_NAME }} 
+          spx config @key --set ${{ secrets.SPEECH_SUBSCRIPTION_KEY }} 
+          spx config @region --set ${{ secrets.SPEECH_RESOURCE_REGION }}
+
+      #########################################################################
+      # Upload training data and create the Custom Speech model.
+      #########################################################################
+
+      # Assemble the Audio + Human-Labeled Transcript in the proper format and
+      # upload the data.
+      #
+      # Check that the data has been successfully uploaded with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Upload audio and human transcript training data
+        if: ${{ env.TRAIN_ZIP_SOURCE_PATH && env.TRAIN_ZIP_SOURCE_PATH != '' }}
+        run: |
+          spx csr dataset upload --data $TRAIN_ZIP_SOURCE_PATH --kind Acoustic --name acoustic_${CURRENT_COMMIT_HASH} --output add url @my.training.datasets --wait
+          audio_trans_train_id=$(cat my.training.datasets | tail -c 36)
+          if ! [[ ${audio_trans_train_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to upload audio and human-labeled transcript training data. Check that the correct paths are defined in environment variables or re-run all jobs."
+            exit 1
+          fi
+          echo "AUDIO_TRANS_TRAIN_ID=$(echo $audio_trans_train_id)" >> $GITHUB_ENV
+
+      # Upload pronunciation data to Speech.
+      #
+      # Check that the data has been successfully uploaded with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Upload pronunciation data
+        if: ${{ env.PRONUNCIATION_FILE_PATH && env.PRONUNCIATION_FILE_PATH != '' }}
+        run: |
+          spx csr dataset upload --data $PRONUNCIATION_FILE_PATH --kind Pronunciation --name pronunciation_${CURRENT_COMMIT_HASH} --output add url @my.training.datasets --wait
+          pronunciation_id=$(tail -1 my.training.datasets | tail -c 36)
+          if ! [[ ${pronunciation_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to upload pronunciation data. Check that the correct paths are defined in environment variables or re-run all jobs."
+            exit 1
+          fi
+          echo "PRONUNCIATION_ID=$(echo $pronunciation_id)" >> $GITHUB_ENV
+
+      # Upload language data to Speech.
+      #
+      # Check that the data has been successfully uploaded with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Upload language data
+        if: ${{ env.RELATED_TEXT_FILE_PATH && env.RELATED_TEXT_FILE_PATH != '' }}
+        run: |
+          spx csr dataset upload --data $RELATED_TEXT_FILE_PATH --kind Language --name language_${CURRENT_COMMIT_HASH} --output add url @my.training.datasets --wait
+          language_id=$(tail -1 my.training.datasets | tail -c 36)
+          if ! [[ ${language_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to upload language data. Check that the correct paths are defined in environment variables or re-run all jobs."
+            exit 1
+          fi
+          echo "LANGUAGE_ID=$(echo $language_id)" >> $GITHUB_ENV
+
+      # Train the Custom Speech Model.
+      #
+      # Check that the Custom Speech model has been successfully trained with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Create Custom Speech model with training data
+        run: |
+          custom_speech_model_name=custom_speech_model_${CURRENT_COMMIT_HASH}
+          spx csr model create --name $custom_speech_model_name --datasets @my.training.datasets --output url @my.model.url --wait
+          custom_speech_model_id=$(cat my.model.url | tail -c 36)
+          if ! [[ ${custom_speech_model_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to create a Custom Speech model. Possibly re-run all jobs."
+            exit 1
+          fi
+          echo "CUSTOM_SPEECH_MODEL_ID=$(echo $custom_speech_model_id)" >> $GITHUB_ENV
+          echo "CUSTOM_SPEECH_MODEL_NAME=$(echo $custom_speech_model_name)" >> $GITHUB_ENV
+
+      # Get the latest baseline model, which is the underlying, non-customized
+      # portion of Custom Speech models.
+      #
+      # Check that the baseline model has been successfully downloaded with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Get latest baseline model
+        if: ${{ env.CUSTOM_SPEECH_MODEL_NAME && env.CUSTOM_SPEECH_MODEL_NAME != '' }}
+        run: |
+          spx csr model list --models --output json models.json
+          jq --arg MODEL_NAME "$CUSTOM_SPEECH_MODEL_NAME" '.values[] | select(.displayName==$MODEL_NAME).baseModel.self' models.json | tr -d \" > models.txt
+          rm models.json
+          tail -1 models.txt | tr -d '[:space:]' > my.base.model
+          base_model_id=$(cat my.base.model | tail -c 36)
+          if ! [[ ${base_model_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to get the latest baseline model. Possibly re-run all jobs."
+            exit 1
+          fi
+          echo "BASE_MODEL_ID=$(echo $base_model_id)" >> $GITHUB_ENV
+
+      - name: Delete training datasets
+        run: |
+          spx csr dataset delete --foreach dataset in my.training.datasets
+          echo DELETED TRAINING DATASETS.
+
+      #########################################################################
+      # Test the Custom Speech model.
+      #########################################################################
+
+      # If test data was updated the Audio + Human-Labeled Transcript will
+      # already have been uploaded, so simply get the latest upload from Speech.
+      #
+      # Otherwise assemble the data and upload to Speech.
+      #
+      # Check that the data has been successfully uploaded with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Upload audio and human transcript testing data
+        run: |
+          if [git diff --name-only $TEST_ZIP_SOURCE_PATH | grep -w '$TEST_ZIP_SOURCE_PATH']
+          then
+            spx csr dataset list --output url @my.testing.datasets
+          else
+            spx csr dataset upload --name audio_trans_test_${CURRENT_COMMIT_HASH} --kind Acoustic --data $TEST_ZIP_SOURCE_PATH --output url @my.testing.datasets --wait 
+          fi
+          audio_trans_test_id=$(tail -1 my.testing.datasets | tail -c 36)
+          if ! [[ ${audio_trans_test_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to upload audio and human-labeled transcript testing data. Check that the correct paths are defined in environment variables or re-run all jobs."
+            exit 1
+          fi
+          echo "AUDIO_TRANS_TEST_ID=$(echo $audio_trans_test_id)" >> $GITHUB_ENV
+
+      # Test with Speech.
+      #
+      # Check that the test has been successfully created with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Test the new Speech model
+        run: |
+          spx csr evaluation create --name test_from_train_data_update_${CURRENT_COMMIT_HASH} --model1 @my.base.model --model2 @my.model.url --dataset @my.testing.datasets --output url @my.test.result --wait 
+          test_id=$(tail -1 my.test.result | tail -c 36)
+          if ! [[ ${test_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to test the Custom Speech model. Possibly re-run all jobs."
+            exit 1
+          fi
+          echo "TEST_ID=$(echo $test_id)" >> $GITHUB_ENV
+
+      - name: Delete testing datasets
+        run: |
+          spx csr dataset delete --foreach dataset in my.testing.datasets
+          echo DELETED AUDIO+HUMAN-LABELED TRANSCRIPT TESTING DATA.
+
+      # Get the content from the test as a JSON file.
+      - name: Store JSON test output
+        run: |
+          test_summary_file_name="test-summary-from-train-data-update-${CURRENT_COMMIT_HASH}.json"
+          echo "TEST_SUMMARY_FILE=$(echo $test_summary_file_name)" >> $GITHUB_ENV
+          spx csr evaluation status --evaluation @my.test.result --output json ${TEST_BUILD_FOLDER_PATH}/$test_summary_file_name
+
+      ###########################################################################
+      # Archiving test results in blob
+      ###########################################################################
+
+      # https://github.com/Azure/azure-cli
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Save test summary in Azure Blob
+        uses: azure/CLI@v1
+        with:
+          inlineScript: az storage blob upload --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name test-results --name $TEST_SUMMARY_FILE --file ${{ env.TEST_BUILD_FOLDER_PATH }}/${{ env.TEST_SUMMARY_FILE }} --auth-mode login
+
+      - name: Save test results in Azure Blob
+        run: |
+          cat ${{ env.TEST_BUILD_FOLDER_PATH }}/${{ env.TEST_SUMMARY_FILE }} > test-results.txt
+          az storage blob upload --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name test-results --name test-results-from-train-data-update-${CURRENT_COMMIT_HASH}.txt --file test-results.txt --auth-mode login
+
+      # Delete the test. This must be done after the test results file is
+      # generated, as the resultsUrl will only be available while the test
+      # exists.
+      - name: Delete test
+        run: |
+          spx csr evaluation delete --evaluation @my.test.result
+          echo DELETED TEST.
+
+      ###########################################################################
+      # FAIL pipeline and delete assets in Speech Studio if WER did not improve.
+      ###########################################################################
+
+      - name: Verify the configuration file exists
+        run: az storage blob exists --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name configuration --name benchmark-test.txt --auth-mode login | jq '.exists' | xargs -I {} echo "BENCHMARK_BLOB_EXISTS={}" >> $GITHUB_ENV
+
+      - name: Get the benchmark Word Error Rate (WER)
+        if: ${{ env.BENCHMARK_BLOB_EXISTS == 'true' }}
+        run: |
+          az storage blob download --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name configuration --name benchmark-test.txt --file previous-benchmark-test.txt --auth-mode login
+          benchmark_test_results_name=$(cat previous-benchmark-test.txt)
+          az storage blob download --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name test-results --name $(echo $benchmark_test_results_name) --file benchmark-test-results.json --auth-mode login
+          jq '.properties.wordErrorRate2' benchmark-test-results.json | xargs -I {} echo "BENCHMARK_WER={}" >> $GITHUB_ENV
+
+      # Get NEW_WER from the newly-created test results file.
+      - name: Get the new Word Error Rate (WER)
+        if: ${{ env.BENCHMARK_BLOB_EXISTS == 'true' }}
+        run: jq '.properties.wordErrorRate2' ${{ env.TEST_BUILD_FOLDER_PATH }}/${{ env.TEST_SUMMARY_FILE }} | xargs -I {} echo "NEW_WER={}" >> $GITHUB_ENV
+
+      - name: CONTINUING WORKFLOW - WER improved
+        if: ${{ env.BENCHMARK_BLOB_EXISTS == 'false' || env.BENCHMARK_WER > env.NEW_WER }}
+        run: |
+          echo ${{ env.TEST_SUMMARY_FILE }} > ${{ env.TEST_BUILD_FOLDER_PATH }}/benchmark-test.txt
+          az storage blob upload --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name configuration --name benchmark-test.txt --file ${{ env.TEST_BUILD_FOLDER_PATH }}/benchmark-test.txt --auth-mode login
+
+      - name: STOPPING WORKFLOW - WER not improved
+        if: ${{ env.BENCHMARK_WER <= env.NEW_WER }}
+        run: |
+          spx csr model delete --model @my.model.url
+          spx config @spx.defaults --set @@none
+          echo DELETED CUSTOM SPEECH MODEL AND CONFIGURATION.
+          echo "::error ::Failed to improve upon the benchmark Custom Speech model. Submit a pull request with updates to training data to try again."
+          exit 1
+
+      # Delete all potentially sensitive config variables from build machine
+      - name: Delete Model configuration 
+        run: |
+          spx config @spx.defaults --set @@none
+          echo MODEL CONFIGURATION DELETED
+  
+
+  #############################################################################
+  #
+  #   Continuous Delivery - create release after updates to training data.
+  #
+  #############################################################################
+
+  release:
+    name: Release improved endpoint
+    runs-on: ubuntu-latest
+    # Execute when setup, test_data_update, and train_data_update finish
+    # executing and pass.
+    needs: [setup, train_data_update]
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2
+      #   with:
+      #     lfs: true
+
+      # - name: Checkout LFS objects
+      #   run: git lfs checkout
+
+      - name: Fetch all history for all tags and branches - for GitVersion
+        if: ${{ env.IS_PRIVATE_REPOSITORY == 'false' }}
+        run: git fetch --prune --unshallow
+
+      - name: Fetch all history for all tags and branches (private repo) - for GitVersion
+        if: ${{ env.IS_PRIVATE_REPOSITORY == 'true' }}
+        run: |
+          git config remote.origin.url https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git fetch --prune --unshallow
+
+      # https://github.com/GitTools/GitVersion
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@v0.9.7
+        with:
+          versionSpec: "5.5.x"
+
+      - name: Use GitVersion
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v0.9.7
+
+      - name: Set environment variables
+        run: |
+          echo "CURRENT_COMMIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "RELEASE_FILE=release-endpoints.json" >> $GITHUB_ENV
+          echo "SEMANTIC_VERSION=$GitVersion_SemVer" >> $GITHUB_ENV
+          echo "TRAIN_BUILD_FOLDER_PATH=build-speech-train" >> $GITHUB_ENV
+
+      # https://github.com/Azure-Samples/cognitive-services-speech-tools
+      - name: Install and configure Speech CLI
+        run: |
+          dotnet tool install -g Microsoft.CognitiveServices.Speech.CLI --version ${{ env.SPX_VERSION }}
+          spx config @name --set ${{ secrets.SPEECH_PROJECT_NAME }} 
+          spx config @key --set ${{ secrets.SPEECH_SUBSCRIPTION_KEY }} 
+          spx config @region --set ${{ secrets.SPEECH_RESOURCE_REGION }}
+
+      # First get a json of all models and save model ids to txt file 
+      # Check that the benchmark model has been successfully downloaded with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Get the benchmark Speech model
+        run: |
+          mkdir ${{ env.TRAIN_BUILD_FOLDER_PATH }}
+          spx csr model list --models --output json ${{ env.TRAIN_BUILD_FOLDER_PATH }}/speech-model-list.json
+          jq '.values[].self' ${{ env.TRAIN_BUILD_FOLDER_PATH }}/speech-model-list.json | tr -d \" > ${{ env.TRAIN_BUILD_FOLDER_PATH }}/speech-model-list.txt
+          rm ${{ env.TRAIN_BUILD_FOLDER_PATH }}/speech-model-list.json
+          custom_speech_model_id=$(tail -1 ${{ env.TRAIN_BUILD_FOLDER_PATH }}/speech-model-list.txt | tr -d '[:space:]' | tail -c 36)
+          if ! [[ ${custom_speech_model_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to get the benchmark Custom Speech model. Possibly re-run all jobs."
+            exit 1
+          fi
+          spx csr model list --models --output url @my.model.url
+          echo "CUSTOM_SPEECH_MODEL_ID=$(echo $custom_speech_model_id)" >> $GITHUB_ENV
+
+      - name: Delete all but the 5 latest models
+        run: |
+          speech_model_list_file=${{ env.TRAIN_BUILD_FOLDER_PATH }}/speech-model-list.txt
+          number_of_models_to_delete=$(($( wc -l < "$speech_model_list_file") - 5))
+          if [[ $number_of_models_to_delete -gt 0 ]]
+          then
+            while read -a line
+            do
+              line_url=$(cat line | tr -d '[:space:]')
+              line_id=$(cat line_url | tail -c 36)
+              if [[ ${line_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+              then
+                spx csr model delete --model $line_url
+                if [[ ${?} -gt 0 ]]
+                then
+                  echo "::warning::Bad deletion request detected, likely scenario a model is still attached to an endpoint"
+                else
+                  echo DELETED CUSTOM SPEECH MODEL WITH GUID: "$line"
+                fi
+              fi
+            done < "$speech_model_list_file" | head -$number_of_models_to_delete
+          fi
+
+      # Create a file containing the endpoint from the improved Custom Speech
+      # model trained in this run of the workflow. This file will be stored in a
+      # GitHub release.
+      #
+      # Check that the endpoint has been successfully created with
+      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
+      # the variable is a valid GUID with 32 hexadecimal characters.
+      - name: Create Release Asset
+        run: |
+          spx csr endpoint create --name endpoint_${CURRENT_COMMIT_HASH} --language ${{ env.SPEECH_LOCALE }} --model @my.model.url --output url @my.endpoint.url --wait
+          endpoint_id=$(cat my.endpoint.url | tail -c 36)
+          if ! [[ ${endpoint_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
+          then
+            echo "::error ::Failed to create an endpoint. Possibly re-run all jobs."
+            exit 1
+          fi
+          echo '{"ENDPOINT_ID":"'$endpoint_id'"}' > ${{ env.TRAIN_BUILD_FOLDER_PATH }}/${{ env.RELEASE_FILE }}
+
+      # Create a GitHub release named with the repository's current semantic
+      # version.
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.SEMANTIC_VERSION }}
+          release_name: Release ${{ env.SEMANTIC_VERSION }}
+          body: |
+            Releasing new Release Asset
+            draft: false
+            prerelease: false
+
+      # Upload the file release-endpoints.json to the GitHub release. It will
+      # contain the endpoint from the improved Custom Speech model trained in
+      # this run of the workflow.
+      - name: Upload Release Asset
+        id: upload-release-asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.TRAIN_BUILD_FOLDER_PATH }}/${{ env.RELEASE_FILE }}
+          asset_name: ${{ env.RELEASE_FILE }}
+          asset_content_type: application/json
+
+      # Delete all potentially sensitive config variables from build machine
+      - name: Delete Endpoint configuration 
+        run: |
+          spx config @spx.defaults --set @@none
+          echo ENDPOINT CONFIGURATION DELETED
+  
